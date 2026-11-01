@@ -813,11 +813,16 @@ class Instaloader:
         """
 
         if not userids:
-            data = self.context.graphql_query("d15efd8c0c5b23f0ef71f18bf363c704",
-                                              {"only_stories": True})["data"]["user"]
-            if data is None:
-                raise BadResponseException('Bad stories reel JSON.')
-            userids = list(edge["node"]["id"] for edge in data["feed_reels_tray"]["edge_reels_tray_to_reel"]["edges"])
+            if self.context.iphone_support:
+                tray = self.context.get_iphone_json('api/v1/feed/reels_tray/', {}).get("tray") or []
+                userids = [int(entry["user"]["pk"]) for entry in tray if (entry.get("user") or {}).get("pk")]
+            else:
+                data = self.context.graphql_query("d15efd8c0c5b23f0ef71f18bf363c704",
+                                                  {"only_stories": True})["data"]["user"]
+                if data is None:
+                    raise BadResponseException('Bad stories reel JSON.')
+                userids = list(edge["node"]["id"] for edge in
+                               data["feed_reels_tray"]["edge_reels_tray_to_reel"]["edges"])
 
         def _userid_chunks():
             assert userids is not None
@@ -826,9 +831,17 @@ class Instaloader:
                 yield userids[i:i + userids_per_query]
 
         for userid_chunk in _userid_chunks():
-            stories = self.context.graphql_query("303a4ae99711322310f25250d988f3b7",
-                                                 {"reel_ids": userid_chunk, "precomposed_overlay": False})["data"]
-            yield from (Story(self.context, media) for media in stories['reels_media'])
+            if self.context.iphone_support:
+                # The legacy query_hash reels_media query is answered with a redirect
+                # to the homepage; the mobile API serves the same reels.
+                reels = self.context.get_iphone_json(
+                    'api/v1/feed/reels_media/?reel_ids={}'.format(
+                        ','.join(str(userid) for userid in userid_chunk)), {}).get("reels") or {}
+                yield from (Story.from_iphone_reel(self.context, reel) for reel in reels.values())
+            else:
+                stories = self.context.graphql_query("303a4ae99711322310f25250d988f3b7",
+                                                     {"reel_ids": userid_chunk, "precomposed_overlay": False})["data"]
+                yield from (Story(self.context, media) for media in stories['reels_media'])
 
     @_requires_login
     def download_stories(self,
@@ -945,6 +958,14 @@ class Instaloader:
         """
 
         userid = user if isinstance(user, int) else user.userid
+        if self.context.iphone_support:
+            # The legacy query_hash highlights query is answered with a redirect
+            # to the homepage; the mobile API serves the same highlights tray.
+            tray = self.context.get_iphone_json(
+                'api/v1/highlights/{}/highlights_tray/'.format(userid), {}).get("tray") or []
+            owner = user if isinstance(user, Profile) else None
+            yield from (Highlight.from_iphone_tray_entry(self.context, entry, owner) for entry in tray)
+            return
         data = self.context.graphql_query("7c16654f22c819fb63d1183034a5162f",
                                           {"user_id": userid, "include_chaining": False, "include_reel": False,
                                            "include_suggested_users": False, "include_logged_out_extras": False,

@@ -415,8 +415,9 @@ class Post:
                     "shortcode": self.shortcode,
                     "__relay_internal__pv__PolarisAIGMMediaWebLabelEnabledrelayprovider": False,
                 },
-                # As the logged-out web app does.
-                web_api=not self._context.is_logged_in,
+                # As the web app does, logged in and logged out alike; the legacy
+                # graphql/query endpoint answers this query with a homepage redirect.
+                web_api=True,
             )
             web_info = (resp.get("data") or {}).get("xdt_api__v1__media__shortcode__web_info") or {}
             items = web_info.get("items")
@@ -1074,6 +1075,9 @@ class Profile:
         .. versionadded:: 4.5.2"""
         if not context.is_logged_in:
             raise LoginRequiredException("Login required to access own profile.")
+        if context.iphone_support:
+            user = context.get_iphone_json('api/v1/accounts/current_user/', {})["user"]
+            return cls(context, {**user, "id": user.get("id") or user.get("pk")})
         return cls(context, context.graphql_query("d6f4427fbe92d846298cf93df0b937d3", {})["data"]["user"])
 
     def _asdict(self):
@@ -1507,7 +1511,9 @@ class Profile:
         self._obtain_metadata()
         return NodeIterator(
             context = self._context,
-            edge_extractor = lambda d: d['data']['xdt_api__v1__clips__user__connection_v2'],
+            # The connection is null (rather than empty) for a profile without reels.
+            edge_extractor = lambda d: d['data']['xdt_api__v1__clips__user__connection_v2'] or
+                                       {'edges': [], 'page_info': {'has_next_page': False, 'end_cursor': None}},
             # Reels post info is incomplete relative to regular posts so we create a Post from the shortcode
             # and fetch the additional metadata with an additional API request per Reel
             node_wrapper = lambda n: Post.from_shortcode(context=self._context, shortcode=n["media"]["code"]),
@@ -1518,6 +1524,7 @@ class Profile:
             # fb_api_req_friendly_name=PolarisProfileReelsTabContentQuery_connection
             doc_id = '7845543455542541',
             query_hash = None,
+            web_api = True,
         )
 
     def get_igtv_posts(self) -> NodeIterator[Post]:
@@ -1857,6 +1864,24 @@ class StoryItem:
         return None
 
 
+def _normalize_iphone_story_item(item: Dict[str, Any]) -> Dict[str, Any]:
+    """Normalize an item of the mobile ``reels_media`` API to the node shape of a GraphQL story item."""
+    is_video = item.get("media_type") == 2
+    candidates = (item.get("image_versions2") or {}).get("candidates") or []
+    node: Dict[str, Any] = {
+        "id": str(item["pk"]),
+        "taken_at_timestamp": item["taken_at"],
+        "expiring_at_timestamp": item.get("expiring_at") or item["taken_at"] + 86400,
+        "__typename": "GraphStoryVideo" if is_video else "GraphStoryImage",
+        "is_video": is_video,
+        "display_resources": [{"src": candidate["url"]} for candidate in candidates],
+        "iphone_struct": item,
+    }
+    if is_video:
+        node["video_resources"] = [{"src": version["url"]} for version in item.get("video_versions") or []]
+    return node
+
+
 class Story:
     """
     Structure representing a user story with its associated items.
@@ -1884,6 +1909,21 @@ class Story:
         self._unique_id: Optional[str] = None
         self._owner_profile: Optional[Profile] = None
         self._iphone_struct_: Optional[Dict[str, Any]] = None
+
+    @classmethod
+    def from_iphone_reel(cls, context: InstaloaderContext, reel: Dict[str, Any]) -> "Story":
+        """Create a Story from a reel of the mobile ``reels_media`` API."""
+        user = reel["user"]
+        items = [_normalize_iphone_story_item(item) for item in reel.get("items") or []]
+        node = {
+            "id": str(reel["id"]),
+            "seen": reel.get("seen"),
+            "latest_reel_media": reel.get("latest_reel_media") or max(
+                (item["taken_at_timestamp"] for item in items), default=0),
+            "user": {"id": str(user["pk"]), "username": user.get("username", "")},
+            "items": items,
+        }
+        return cls(context, node)
 
     def __repr__(self):
         return '<Story by {} changed {:%Y-%m-%d_%H-%M-%S_UTC}>'.format(self.owner_username, self.latest_media_utc)
@@ -2032,8 +2072,35 @@ class Highlight(Story):
         """URL of the cropped version of the cover."""
         return self._node['cover_media_cropped_thumbnail']['url']
 
+    @classmethod
+    def from_iphone_tray_entry(cls, context: InstaloaderContext, entry: Dict[str, Any],
+                               owner: Optional[Profile] = None) -> "Highlight":
+        """Create a Highlight from an entry of the mobile ``highlights_tray`` API."""
+        cover = entry.get("cover_media") or {}
+        cropped = cover.get("cropped_image_version") or {}
+        full = cover.get("full_image_version") or {}
+        thumbnail = cropped.get("url") or full.get("url")
+        if owner is not None:
+            owner_node = {"id": str(owner.userid), "username": owner.username}
+        else:
+            user = entry["user"]
+            owner_node = {"id": str(user["pk"]), "username": user.get("username", "")}
+        node = {
+            "id": str(entry["id"]).rsplit(":", maxsplit=1)[-1],
+            "title": entry.get("title", ""),
+            "cover_media": {"thumbnail_src": thumbnail},
+            "cover_media_cropped_thumbnail": {"url": cropped.get("url") or thumbnail},
+            "owner": owner_node,
+        }
+        return cls(context, node, owner)
+
     def _fetch_items(self):
         if not self._items:
+            if self._context.iphone_support and self._context.is_logged_in:
+                self._fetch_iphone_struct()
+                self._items = [_normalize_iphone_story_item(item)
+                               for item in (self._iphone_struct_ or {}).get("items") or []]
+                return
             self._items = self._context.graphql_query("45246d3fe16ccc6577e0bd297a5db1ab",
                                                       {"reel_ids": [], "tag_names": [], "location_ids": [],
                                                        "highlight_reel_ids": [str(self.unique_id)],
